@@ -1,5 +1,7 @@
 # 星塔旅人美术替换工具
 
+[下载免安装包](https://github.com/waw1w1/Stella-Sora-Switch/releases/download/v1.0.0/Stella-Sora-Switch-Portable.zip)
+
 ## 安装环境
 
 在工具目录执行：
