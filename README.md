@@ -4,14 +4,16 @@
 
 ## 安装环境
 
-需要下载完整日服游戏。
-
-在工具目录执行：
+执行以下命令下载工具并安装环境：
 
 ```powershell
+git clone https://github.com/waw1w1/Stella-Sora-Switch.git
+cd Stella-Sora-Switch
 uv venv --python 3.11 .venv
 uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 ```
+
+另需从[日服官网](https://stellasora.jp/)下载 PC 版，并完成全部游戏资源下载。
 
 ## 使用
 
