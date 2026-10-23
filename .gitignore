@@ -1,0 +1,12 @@
+.runtime/
+.venv/
+.python/
+.work/
+backups/
+reports/
+__pycache__/
+MEMORY.md
+
+settings.json
+dist/
+*.zip
