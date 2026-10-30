@@ -339,7 +339,108 @@ def check_restored_bases(cn, state):
         raise RuntimeError('恢复后仍缺少官方更新所需原件，请先修复游戏资源：' + '、'.join(missing[:12]))
 
 
-def restore(cn):
+def write_client_bytes(path, payload):
+    """Back up client records and replace bytes without newline conversion."""
+    if path.is_file():
+        if path.read_bytes() == payload:
+            return
+        backup = ROOT / 'backups/objects' / digest(path)
+        if not backup.exists():
+            atomic_copy(path, backup)
+        if digest(backup) != digest(path):
+            raise RuntimeError('客户端记录备份校验失败：' + path.name)
+    tmp = ROOT / '.work' / ('client-' + uuid.uuid4().hex)
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        tmp.write_bytes(payload)
+        atomic_copy(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def audit_official_bundles(cn, progress=False):
+    """Include bundles never modified by the artwork switch."""
+    _, rows, fingerprint = manifest(cn)
+    missing, verified = [], {}
+    for index, (name, row) in enumerate(rows.items(), 1):
+        found = False
+        for path in layers(cn, name):
+            if (path.is_file() and path.stat().st_size == row['size']
+                    and digest(path, 'md5') == row['md5']):
+                found = True
+                key = ('\\' + str(path.relative_to(cn)).replace('/', '\\')).encode('utf-8')
+                verified[key] = row['md5'].encode('ascii')
+                break
+        if not found:
+            missing.append(name)
+        if progress and (index % 500 == 0 or index == len(rows)):
+            print(f'官方资源校验 {index}/{len(rows)}', flush=True)
+    return rows, fingerprint, missing, verified
+
+
+def prepare_official_update(cn):
+    """Repair indexes or request the client's own resource supplementation."""
+    print('核对全部官方资源包及更新索引……', flush=True)
+    rows, fingerprint, missing, verified = audit_official_bundles(cn, progress=True)
+    ensure_closed()
+    if manifest(cn)[2] != fingerprint:
+        raise RuntimeError('检查期间官方清单发生变化，请重试。')
+    if missing:
+        path = cn / 'prefs.dat'
+        if not path.is_file():
+            raise RuntimeError('缺少 prefs.dat，请使用游戏内资源修复。')
+        data = path.read_bytes()
+        key = b'RESOURCE_SUPPLEMENT_MODE_ENABLE:'
+        lines, seen = [], False
+        for line in data.splitlines(keepends=True):
+            if line.removeprefix(b'\xef\xbb\xbf').startswith(key):
+                if seen:
+                    raise RuntimeError('资源补全设置重复，请使用游戏内资源修复。')
+                prefix = b'\xef\xbb\xbf' if line.startswith(b'\xef\xbb\xbf') else b''
+                ending = b'\r\n' if line.endswith(b'\r\n') else b'\n' if line.endswith(b'\n') else b''
+                line = prefix + key + b'1' + ending
+                seen = True
+            lines.append(line)
+        result = b''.join(lines)
+        if not seen:
+            ending = b'\r\n' if b'\r\n' in data else b'\n'
+            result += (ending if result and not result.endswith(b'\n') else b'') + key + b'1' + ending
+        write_client_bytes(path, result)
+        print(f'缺少或损坏的官方资源包 {len(missing)} 个：' + '、'.join(missing[:8]), flush=True)
+        print('已安排官方资源补全。请启动国服完成下载和更新（可能较大），完成前不能重新替换。', flush=True)
+        return
+    # An intact file without a correct path index is still unusable as a diff base.
+    path = cn / 'file_versions.dat'
+    data = path.read_bytes() if path.exists() else b''
+    output, seen = [], set()
+    for line in data.splitlines(keepends=True):
+        key = line.rstrip(b'\r\n').partition(b'|')[0]
+        if key in verified:
+            if key in seen:
+                continue
+            seen.add(key)
+            value = line.rstrip(b'\r\n').partition(b'|')[2]
+            if value.lower().zfill(32) != verified[key]:
+                line = key + b'|' + verified[key] + b'\n'
+        output.append(line)
+    result = b''.join(output)
+    for key, value in verified.items():
+        if key not in seen:
+            if result and not result.endswith(b'\n'):
+                result += b'\n'
+            result += key + b'|' + value + b'\n'
+    write_client_bytes(path, result)
+    print(f'全部 {len(rows)} 个官方资源包及索引检查通过。', flush=True)
+    if client_values(cn / 'prefs.dat').get('RESOURCE_SUPPLEMENT_MODE_ENABLE', '0') != '0':
+        print('仍有待执行的资源补全，请先启动国服完成修复和更新。', flush=True)
+
+
+def require_resources_ready(cn):
+    if client_values(cn / 'prefs.dat').get('RESOURCE_SUPPLEMENT_MODE_ENABLE', '0') != '0':
+        raise RuntimeError('国服已安排资源补全，请先启动国服完成修复和更新，再一键替换。')
+
+
+def restore(cn, prepare_update=False):
     state = read_state()
     if not state:
         # Older versions archived incomplete recoveries. Permit a scoped retry.
@@ -350,9 +451,14 @@ def restore(cn):
                 continue
             count = recover_update_bases(cn, previous)
             index_count = restore_file_index_entries(cn, previous)
-            check_restored_bases(cn, previous)
-            print(f'当前无已应用替换；历史恢复检查通过，补回 {count} 个原件、{index_count} 条索引。', flush=True)
+            if prepare_update:
+                prepare_official_update(cn)
+            else:
+                check_restored_bases(cn, previous)
+            print(f'当前无已应用替换；补回 {count} 个原件、{index_count} 条索引。', flush=True)
             return
+        if prepare_update:
+            prepare_official_update(cn)
         print('没有待恢复的替换记录或历史备份。', flush=True)
         return
     if state['cn'] != str(cn):
@@ -405,6 +511,7 @@ def restore(cn):
         patch_not_advanced = False
     mani = cn / 'Persistent_Store/ss_win.mani'
     can_restore_state = (not preserved and snapshots
+                         and now.get('RESOURCE_SUPPLEMENT_MODE_ENABLE', '0') == '0'
                          and mani.is_file() and digest(mani) == state['fingerprints'][0]
                          and now.get('PACKAGE_TAGS') == before.get('PACKAGE_TAGS')
                          and patch_not_advanced)
@@ -415,12 +522,16 @@ def restore(cn):
     elif snapshots:
         print('检测到后续更新或客户端状态变化，保留当前客户端记录。', flush=True)
         restore_file_index_entries(cn, state)
-    # Never archive an incomplete recovery as success; keep active.json for retries.
-    check_restored_bases(cn, state)
+    # Automatic/internal rollback stays strict. Explicit restore may hand missing
+    # official bundles to the client's repair after artwork has been withdrawn.
+    if prepare_update:
+        prepare_official_update(cn)
+    else:
+        check_restored_bases(cn, state)
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
     save_json(ROOT / f'backups/history/{stamp}.json', dict(state, restored=restored, preserved_updates=preserved))
     STATE.unlink()
-    print(f'恢复完成：{restored} 个文件；保留更新器或其他程序改动的文件 {len(preserved)} 个。', flush=True)
+    print(f'美术替换已撤销：{restored} 个文件；保留更新器或其他程序改动的文件 {len(preserved)} 个。', flush=True)
 
 
 def inspect_bundle(p):
@@ -929,6 +1040,7 @@ def verify(cn, verbose=True):
 
 
 def apply(cn, jp):
+    require_resources_ready(cn)
     # A mismatched JP update must not undo a working CN artwork replacement.
     cm, _, _ = manifest(cn)
     jm, _, _ = manifest(jp)
@@ -941,6 +1053,10 @@ def apply(cn, jp):
         return
     if old:
         restore(cn)
+    print('替换前核对官方资源完整性……', flush=True)
+    _, _, missing, _ = audit_official_bundles(cn, progress=True)
+    if missing:
+        raise RuntimeError('国服官方资源缺失或损坏，请先运行一键恢复安排资源补全：' + '、'.join(missing[:8]))
     report = reusable_plan(cn, jp)
     if not report['bundles']:
         print('本版本没有可安全替换的差异美术包。')
@@ -1033,7 +1149,7 @@ def main():
         if args.action == 'apply':
             apply(cn, jp)
         elif args.action == 'restore':
-            restore(cn)
+            restore(cn, prepare_update=True)
         elif args.action == 'verify':
             if not verify(cn):
                 return 2

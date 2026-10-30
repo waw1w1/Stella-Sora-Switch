@@ -7,7 +7,8 @@ import zipfile
 ROOT = Path(__file__).resolve().parent
 ENTRIES = ('一键替换.cmd', '一键恢复.cmd', '校验替换.cmd', '选择游戏目录.cmd')
 RUNTIME_FILES = ('replace_art.py', 'requirements.txt', *ENTRIES)
-SOURCE_FILES = (*RUNTIME_FILES, 'README.md', '.gitignore', 'build_release.py')
+SOURCE_FILES = (*RUNTIME_FILES, 'README.md', '.gitignore', 'build_release.py',
+                'tests/test_resource_recovery.py')
 # Compiler intermediates and Python caches are not runtime dependencies.
 BUILD_SUFFIXES = {'.pyc', '.pyo', '.iobj', '.ipdb', '.pdb', '.obj', '.exp', '.lib'}
 # The tool processes Unity texture bytes, not AVIF/WebP, fonts, ICC profiles or Tk.
