@@ -23,6 +23,8 @@ sys.path.insert(0, str(ROOT / '.runtime'))
 STATE = ROOT / 'backups/active.json'
 ART = re.compile(r'^(?:char_(?:2d_|avg_2d_|l2d_|2dsp_)|npc_(?:2d_|l2d_)|disc_|cg_|icon-|image(?:avg)?-)')
 COVER = re.compile(r'^ui_gachacover_cover_\d+\.unity3d$')
+ICON = re.compile(r'^icon-[0-9a-f]+\.unity3d$')
+ICON_PORTRAIT = re.compile(r'^assets/assetbundles/icon/(?:head/head_\d+_[a-z0-9_]+|avghead/avg\d+_\d+/avg\d+_\d+_\d+)\.png$')
 COVER_TEXTURE = re.compile(r'^assets/assetbundles/ui_gachacover/cover_\d+/(?:sprite|textures?)/(?:(?:bg|zs|fx)_gacha_)[a-z0-9_]+\.png$')
 UI_ART = {'ui_big_sprites.unity3d': re.compile(r'^assets/assetbundles/ui/big_sprites/zs_startowerhandbook_entrance\d+\.png$')}
 HASH_CACHE = {}
@@ -892,6 +894,18 @@ def build_plan(cn, jp):
             print(f'{name}：保留 {len(preserved_motions)} 个兼容国服动作资源，采用日服美术。', flush=True)
         # Never guess substitute motions or silently drop CN public entry points.
         if missing:
+            # Region-only banners must not block unrelated character portraits.
+            # Keep every CN entry, Sprite and non-portrait object in this bundle.
+            if ICON.fullmatch(name):
+                output = work / name
+                details = patch_cover_textures(cp, jpfile, output, ICON_PORTRAIT)
+                if details:
+                    plan[name] = dict(details, output=str(output), source=str(jpfile.relative_to(jp)),
+                                      aliases=0, sha256=digest(output), mode='保留国服图标包，仅替换角色头像和卡面')
+                    print(f"角色图标 {name}：替换 {len(details['textures'])} 张贴图，保留国服独有入口。", flush=True)
+                    del ce, ca, ct, je, ja, jt
+                    gc.collect()
+                    continue
             skipped[name] = {'reason': '日服缺少国服公开资源入口', 'missing': missing}
             continue
         if sorted(a.name for a in ce.assets) != sorted(a.name for a in je.assets):
