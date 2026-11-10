@@ -209,6 +209,52 @@ class ResourceRecoveryTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), self.payload)
         self.assertFalse(a.STATE.exists())
 
+    def test_parallel_preparation_failure_never_changes_live_files(self):
+        jp = self.prepare_switch()
+        report = a.reusable_plan.return_value
+        template = report['bundles'][self.name]
+        targets = [self.target]
+        for index in range(16):
+            name = f'char_2d_{index}.unity3d'
+            target = self.target.with_name(name)
+            target.write_bytes(self.payload)
+            targets.append(target)
+            with self.mani.open('a', encoding='utf-8') as f:
+                f.write(f'{name}|{self.md5}|{len(self.payload)}|0|\n')
+            report['bundles'][name] = dict(template)
+        shutil.copyfile(self.mani, jp / 'Persistent_Store/ss_win.mani')
+        report['fingerprints'] = [a.manifest(self.cn)[2], a.manifest(jp)[2]]
+        failed_slot = a.switch_slot(self.cn, str(targets[-1].relative_to(self.cn)), 'patched')
+        real_copy = a.atomic_copy
+
+        def fail_one(src, dst):
+            if dst == failed_slot:
+                raise OSError('simulated copy failure')
+            return real_copy(src, dst)
+
+        with patch.object(a, 'atomic_copy', side_effect=fail_one):
+            with self.assertRaisesRegex(OSError, 'simulated copy failure'):
+                a.apply(self.cn, jp)
+        self.assertFalse(a.STATE.exists())
+        self.assertTrue(all(p.read_bytes() == self.payload for p in targets))
+
+    def test_missing_unrelated_resource_blocks_write_after_parallel_planning(self):
+        jp = self.prepare_switch()
+        with self.mani.open('a', encoding='utf-8') as f:
+            f.write(f'missing.unity3d|{self.md5}|{len(self.payload)}|0|\n')
+        with self.assertRaisesRegex(RuntimeError, '官方资源缺失或损坏'):
+            a.apply(self.cn, jp)
+        self.assertFalse(a.STATE.exists())
+        self.assertFalse((self.cn / '.art-switch').exists())
+        self.assertEqual(self.target.read_bytes(), self.payload)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows filename case insensitivity')
+    def test_directory_scan_keeps_manifest_path_casing(self):
+        self.install()
+        self.target.rename(self.target.with_name(self.name.upper()))
+        a.prepare_official_update(self.cn)
+        self.assertIn(self.key + b'|' + self.md5.encode(), self.index.read_bytes())
+
 
 class FastValidationTests(unittest.TestCase):
     def setUp(self):
@@ -238,6 +284,45 @@ class FastValidationTests(unittest.TestCase):
         expected = self.seed()
         with patch.object(Path, 'open', side_effect=AssertionError('must not reread payload')):
             self.assertEqual(a.digest(self.path), expected)
+
+    def test_parallel_requests_read_one_file_only_once(self):
+        results = a.io_map(a.digest, [self.path] * 32)
+        self.assertEqual(set(results), {hashlib.sha256(self.path.read_bytes()).hexdigest()})
+        self.assertEqual(a.HASH_STATS['read'], 1)
+
+    def test_worker_hash_preserves_other_verified_algorithm(self):
+        md5 = a.digest(self.path, 'md5')
+        sha256 = hashlib.sha256(self.path.read_bytes()).hexdigest()
+        a.remember_hashes(a.hash_key(self.path), {'sha256': sha256})
+        with patch.object(Path, 'open', side_effect=AssertionError('already verified')):
+            self.assertEqual(a.digest(self.path, 'md5'), md5)
+            self.assertEqual(a.digest(self.path), sha256)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows long-path namespace')
+    def test_long_path_prefix_does_not_hide_or_invent_path_escape(self):
+        for root in (self.root, Path(r'\\server\share\client')):
+            for relative, allowed in (('child', True), ('../outside', False), ('.', False)):
+                normal = Path(os.path.normpath(root / relative))
+                extended = Path('\\\\?\\UNC\\' + str(normal)[2:]) if str(normal).startswith('\\\\') else Path('\\\\?\\' + str(normal))
+                with self.subTest(root=root, relative=relative):
+                    with patch.object(Path, 'resolve', side_effect=[root, extended]):
+                        if allowed:
+                            self.assertEqual(a.safe(root, relative), extended)
+                        else:
+                            with self.assertRaisesRegex(RuntimeError, '路径越界'):
+                                a.safe(root, relative)
+
+    def test_parallel_directory_creation_keeps_safe_path_checks(self):
+        for iteration in range(20):
+            client = self.root / str(iteration)
+            client.mkdir()
+            def create(index):
+                path = a.safe(client, f'.art-switch/{index}.patched')
+                path.parent.mkdir(exist_ok=True)
+                return path
+            self.assertEqual(len(a.io_map(create, range(32))), 32)
+        with self.assertRaisesRegex(RuntimeError, '路径越界'):
+            a.safe(self.root, '../outside')
 
     def test_same_size_edit_with_reset_mtime_invalidates_cache(self):
         self.require_ntfs()
@@ -278,9 +363,26 @@ class FastValidationTests(unittest.TestCase):
 
     def test_unavailable_change_time_disables_cross_run_reuse(self):
         expected = self.seed()
-        with patch.object(a, 'file_change_time', return_value=None):
+        with patch.object(a, 'windows_file_signature', return_value=None):
             self.assertEqual(a.digest(self.path), expected)
             self.assertEqual(a.HASH_STATS['bytes'], self.path.stat().st_size)
+
+    def test_native_signature_matches_existing_cache_identity(self):
+        self.require_ntfs()
+        st = self.path.stat()
+        self.assertEqual(a.hash_key(self.path)[1:6],
+                         (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_dev))
+
+    def test_unavailable_change_time_never_reuses_same_process_hash(self):
+        if os.name != 'nt':
+            self.skipTest('Windows metadata fallback')
+        with patch.object(a, 'windows_file_signature', return_value=None):
+            expected = a.digest(self.path)
+            before = self.path.stat()
+            self.path.write_bytes(b'x' * before.st_size)
+            os.utime(self.path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            self.assertNotEqual(a.digest(self.path), expected)
+            self.assertEqual(a.HASH_STATS['read'], 2)
 
     def test_open_writer_disables_cached_validation(self):
         self.require_ntfs()
@@ -348,6 +450,239 @@ class FastValidationTests(unittest.TestCase):
             process.terminate()
             process.wait(timeout=10)
             process.stdin.close()
+
+
+class IncrementalBundleTests(unittest.TestCase):
+    def setUp(self):
+        (TOOL / '.work').mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=TOOL / '.work')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.addCleanup(patch.stopall)
+        patch.object(a, 'ROOT', self.root).start()
+        patch.object(a, 'PERSISTENT_HASHES', None).start()
+        self.cn, self.jp = self.root / 'cn', self.root / 'jp'
+        for client, exe in ((self.cn, 'xtlr.exe'), (self.jp, 'StellaSora.exe')):
+            (client / 'Persistent_Store/AssetBundles').mkdir(parents=True)
+            (client / exe).touch()
+        self.cr, self.jr = {'dependency.unity3d': {}}, {}
+        self.names = ['char_2d_1.unity3d', 'char_2d_2.unity3d']
+        for name in self.names:
+            self.install(name)
+        self.direct = False
+        self.builder = patch.object(a, 'build_bundle', side_effect=self.build).start()
+        patch.object(a, 'run_bundle_jobs', side_effect=lambda jobs: list(map(a.run_bundle_job, jobs))).start()
+        a.load_hash_cache()
+
+    def install(self, name):
+        for client, rows, prefix in ((self.cn, self.cr, b'CN'), (self.jp, self.jr, b'JP')):
+            content = prefix + name.encode()
+            (client / 'Persistent_Store/AssetBundles' / name).write_bytes(content)
+            rows[name] = {'md5': hashlib.md5(content).hexdigest(), 'size': len(content)}
+
+    def build(self, job):
+        name, cp, jpfile, jp, names, output = job
+        dependencies = {'dependency.unity3d': 'dependency.unity3d' in names}
+        if not dependencies['dependency.unity3d']:
+            return None, {'reason': 'missing dependency'}, dependencies
+        if self.direct:
+            output = Path(jpfile)
+        else:
+            output = Path(output)
+            output.write_bytes(Path(cp).read_bytes() + Path(jpfile).read_bytes())
+        return {'output': str(output), 'source': str(Path(jpfile).relative_to(jp)),
+                'sha256': a.digest(output), 'deps': ['dependency.unity3d'],
+                'direct': self.direct}, None, dependencies
+
+    def plan(self):
+        return a.incremental_bundles(self.cn, self.jp, self.cr, self.jr, self.names)
+
+    def test_unrelated_manifest_change_reuses_all_bundles(self):
+        first, _ = self.plan()
+        self.cr['unrelated_new_bundle.unity3d'] = {}
+        second, _ = self.plan()
+        self.assertEqual(first, second)
+        self.assertEqual(self.builder.call_count, 2)
+
+    def test_one_changed_source_only_rebuilds_one_bundle(self):
+        first, _ = self.plan()
+        path = self.cn / 'Persistent_Store/AssetBundles' / self.names[0]
+        content = b'new artwork version'
+        path.write_bytes(content)
+        self.cr[path.name] = {'md5': hashlib.md5(content).hexdigest(), 'size': len(content)}
+        second, _ = self.plan()
+        self.assertEqual(self.builder.call_count, 3)
+        self.assertNotEqual(first[path.name]['sha256'], second[path.name]['sha256'])
+        self.assertEqual(first[self.names[1]], second[self.names[1]])
+
+    def test_new_bundle_is_discovered_without_rebuilding_old_ones(self):
+        self.plan()
+        self.names.append('char_2d_3.unity3d')
+        self.install(self.names[-1])
+        plan, _ = self.plan()
+        self.assertEqual(set(plan), set(self.names))
+        self.assertEqual(self.builder.call_count, 3)
+
+    def test_removed_and_returning_dependency_invalidates_analysis(self):
+        self.plan()
+        del self.cr['dependency.unity3d']
+        plan, skipped = self.plan()
+        self.assertFalse(plan)
+        self.assertEqual(set(skipped), set(self.names))
+        self.assertEqual(self.builder.call_count, 4)
+        self.cr['dependency.unity3d'] = {}
+        plan, skipped = self.plan()
+        self.assertEqual(set(plan), set(self.names))
+        self.assertFalse(skipped)
+        self.assertEqual(self.builder.call_count, 6)
+
+    def test_corrupt_output_rebuilt_without_overwriting_old_artifact(self):
+        first, _ = self.plan()
+        output = Path(first[self.names[0]]['output'])
+        before = output.stat()
+        output.write_bytes(b'x' * before.st_size)
+        os.utime(output, ns=(before.st_atime_ns, before.st_mtime_ns))
+        second, _ = self.plan()
+        self.assertEqual(self.builder.call_count, 3)
+        self.assertNotEqual(second[self.names[0]]['output'], str(output))
+        self.assertEqual(first[self.names[0]]['sha256'], second[self.names[0]]['sha256'])
+        self.assertEqual(output.read_bytes(), b'x' * before.st_size)
+
+    def test_source_corruption_is_not_hidden_by_cached_analysis(self):
+        self.plan()
+        path = self.cn / 'Persistent_Store/AssetBundles' / self.names[0]
+        path.write_bytes(b'x' * path.stat().st_size)
+        with self.assertRaisesRegex(RuntimeError, '缺少与当前清单匹配'):
+            self.plan()
+        self.assertEqual(self.builder.call_count, 2)
+
+    def test_tool_change_invalidates_cached_analysis(self):
+        self.plan()
+        real_digest = a.digest
+        with patch.object(a, 'digest', side_effect=lambda path, algorithm='sha256':
+                          'new recipe' if Path(path) == Path(a.__file__) else real_digest(path, algorithm)):
+            self.plan()
+        self.assertEqual(self.builder.call_count, 4)
+
+    def test_direct_source_relocated_to_updated_layer(self):
+        self.direct = True
+        self.plan()
+        name = self.names[0]
+        old = self.jp / 'Persistent_Store/AssetBundles' / name
+        current = self.jp / 'Patch_Store/AssetBundles' / name
+        current.parent.mkdir(parents=True)
+        old.rename(current)
+        plan, _ = self.plan()
+        self.assertEqual(self.builder.call_count, 2)
+        self.assertEqual(plan[name]['output'], str(current))
+        self.assertTrue(a.valid_bundle_output(plan[name], self.jp))
+
+    def test_direct_output_cannot_escape_japanese_resource_layers(self):
+        outside = self.root / 'outside'
+        outside.write_bytes(b'payload')
+        item = {'output': str(outside), 'source': '../outside', 'direct': True,
+                'sha256': a.digest(outside)}
+        self.assertFalse(a.valid_bundle_output(item, self.jp))
+
+
+class LoadingIndexCacheTests(unittest.TestCase):
+    def setUp(self):
+        (TOOL / '.work').mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=TOOL / '.work')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.addCleanup(patch.stopall)
+        patch.object(a, 'ROOT', self.root).start()
+        patch.object(a, 'PERSISTENT_HASHES', None).start()
+        self.cn = self.root / 'cn'
+        (self.cn / 'Persistent_Store/AssetBundles').mkdir(parents=True)
+        (self.cn / 'xtlr.exe').touch()
+        self.source = self.cn / 'Persistent_Store/AssetBundles/win.unity3d'
+        self.source.write_bytes(b'official loading index')
+        self.rows = {'win.unity3d': self.row()}
+        self.plan = {'char_2d_1.unity3d': {'deps': ['dependency.unity3d'], 'sha256': 'art version 1'}}
+        self.builder = patch.object(a, 'build_loading_index', side_effect=self.build).start()
+        a.load_hash_cache()
+
+    def row(self):
+        data = self.source.read_bytes()
+        return {'md5': hashlib.md5(data).hexdigest(), 'size': len(data)}
+
+    def build(self, source, plan, output):
+        output.write_bytes(source.read_bytes() + b'patched dependencies')
+        return {'output': str(output), 'deps': [], 'sha256': a.digest(output)}
+
+    def test_image_or_unrelated_manifest_change_reuses_index(self):
+        before = a.loading_index(self.cn, self.rows, self.plan)
+        self.plan['char_2d_1.unity3d']['sha256'] = 'art version 2'
+        self.rows['unrelated.unity3d'] = {}
+        after = a.loading_index(self.cn, self.rows, self.plan)
+        self.assertEqual(before, after)
+        self.assertEqual(self.builder.call_count, 1)
+
+    def test_dependency_and_selected_bundle_changes_rebuild_index(self):
+        a.loading_index(self.cn, self.rows, self.plan)
+        self.plan['char_2d_1.unity3d']['deps'].append('new_dependency.unity3d')
+        a.loading_index(self.cn, self.rows, self.plan)
+        self.plan['char_2d_2.unity3d'] = {'deps': []}
+        a.loading_index(self.cn, self.rows, self.plan)
+        self.assertEqual(self.builder.call_count, 3)
+
+    def test_updated_official_index_rebuilds_cache(self):
+        a.loading_index(self.cn, self.rows, self.plan)
+        self.source.write_bytes(b'new official index')
+        self.rows['win.unity3d'] = self.row()
+        a.loading_index(self.cn, self.rows, self.plan)
+        self.assertEqual(self.builder.call_count, 2)
+
+    def test_corrupt_source_cannot_be_hidden_by_index_cache(self):
+        a.loading_index(self.cn, self.rows, self.plan)
+        self.source.write_bytes(b'x' * self.source.stat().st_size)
+        with self.assertRaisesRegex(RuntimeError, '缺少与当前清单匹配'):
+            a.loading_index(self.cn, self.rows, self.plan)
+
+    def test_corrupt_output_is_rebuilt(self):
+        before = a.loading_index(self.cn, self.rows, self.plan)
+        Path(before['output']).write_bytes(b'broken')
+        after = a.loading_index(self.cn, self.rows, self.plan)
+        self.assertEqual(self.builder.call_count, 2)
+        self.assertNotEqual(before['output'], after['output'])
+        self.assertEqual(before['sha256'], after['sha256'])
+
+    def test_no_patch_result_is_invalidated_when_dependencies_change(self):
+        self.builder.side_effect = None
+        self.builder.return_value = None
+        self.assertIsNone(a.loading_index(self.cn, self.rows, self.plan))
+        self.assertIsNone(a.loading_index(self.cn, self.rows, self.plan))
+        self.assertEqual(self.builder.call_count, 1)
+        self.plan['new.unity3d'] = {'deps': []}
+        a.loading_index(self.cn, self.rows, self.plan)
+        self.assertEqual(self.builder.call_count, 2)
+
+
+class CompressionTests(unittest.TestCase):
+    def test_fast_lz4_is_lossless_and_restores_library_configuration(self):
+        import sys
+        sys.path.insert(0, str(TOOL / '.runtime'))
+        import lz4.block
+        from UnityPy.helpers import CompressionHelper
+        payload = b'unchanged texture and model bytes' * 4096
+        before = CompressionHelper.COMPRESSION_MAP[2]
+
+        class Bundle:
+            def save(self, packer):
+                self.packer = packer
+                return CompressionHelper.COMPRESSION_MAP[2](payload)
+
+        bundle = Bundle()
+        packed = a.save_bundle(bundle)
+        self.assertEqual(bundle.packer, 'lz4')
+        self.assertEqual(lz4.block.decompress(packed, uncompressed_size=len(payload)), payload)
+        self.assertIs(CompressionHelper.COMPRESSION_MAP[2], before)
+        with patch.object(bundle, 'save', side_effect=RuntimeError('serialize failed')):
+            with self.assertRaisesRegex(RuntimeError, 'serialize failed'):
+                a.save_bundle(bundle)
+        self.assertIs(CompressionHelper.COMPRESSION_MAP[2], before)
 
 
 if __name__ == '__main__':

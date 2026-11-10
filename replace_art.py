@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import copy
 import ctypes
 import datetime
@@ -16,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -35,6 +37,16 @@ FORCE_FULL_HASHES = False
 HASH_STATS = collections.Counter()
 WINDOWS_API = None
 VOLUME_CACHE = {}
+HASH_LOCKS = [threading.RLock() for _ in range(64)]
+HASH_STATS_LOCK = threading.Lock()
+
+
+def io_map(function, items):
+    items = list(items)
+    if len(items) < 16:
+        return list(map(function, items))
+    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+        return list(pool.map(function, items))
 
 
 def windows_api():
@@ -47,6 +59,12 @@ def windows_api():
             _fields_ = [(name, ctypes.c_longlong) for name in
                         ('creation', 'access', 'write', 'change')] + [('attributes', w.DWORD)]
 
+        class FileInfo(ctypes.Structure):
+            _fields_ = [('attributes', w.DWORD), ('creation', w.FILETIME),
+                        ('access', w.FILETIME), ('write', w.FILETIME), ('volume', w.DWORD),
+                        ('size_hi', w.DWORD), ('size_lo', w.DWORD), ('links', w.DWORD),
+                        ('id_hi', w.DWORD), ('id_lo', w.DWORD)]
+
         class ProcessEntry(ctypes.Structure):
             _fields_ = [('size', w.DWORD), ('usage', w.DWORD), ('pid', w.DWORD),
                         ('heap', ctypes.c_size_t), ('module', w.DWORD), ('threads', w.DWORD),
@@ -57,6 +75,7 @@ def windows_api():
         signatures = {
             'CreateFileW': ([w.LPCWSTR, w.DWORD, w.DWORD, w.LPVOID, w.DWORD, w.DWORD, w.HANDLE], w.HANDLE),
             'GetFileInformationByHandleEx': ([w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD], w.BOOL),
+            'GetFileInformationByHandle': ([w.HANDLE, ctypes.POINTER(FileInfo)], w.BOOL),
             'GetVolumeInformationByHandleW': ([w.HANDLE, w.LPWSTR, w.DWORD, w.LPDWORD,
                                               w.LPDWORD, w.LPDWORD, w.LPWSTR, w.DWORD], w.BOOL),
             'CloseHandle': ([w.HANDLE], w.BOOL),
@@ -69,22 +88,26 @@ def windows_api():
         for name, (args, result) in signatures.items():
             fn = getattr(kernel, name)
             fn.argtypes, fn.restype = args, result
-        WINDOWS_API = kernel, BasicInfo, ProcessEntry
+        WINDOWS_API = kernel, BasicInfo, ProcessEntry, FileInfo
     return WINDOWS_API
 
 
-def file_change_time(path, device):
-    # On Windows st_ctime is creation time, NOT metadata change time. In-place
-    # edits followed by restoring mtime must still invalidate a previous hash.
+def windows_file_signature(path):
+    # Read identity, size and timestamps from one handle. A separate stat call
+    # would open the same file again and could observe another file after rename.
     if os.name != 'nt' or str(path).startswith('\\\\'):
         return None
-    kernel, BasicInfo, _ = windows_api()
+    kernel, BasicInfo, _, FileInfo = windows_api()
     # Do not reuse metadata while another handle has write access: NTFS can
     # defer timestamp updates until that writer closes its handle.
     handle = kernel.CreateFileW(str(path), 0x80000000, 5, None, 3, 0x02000000, None)
     if handle == ctypes.c_void_p(-1).value:
         return None
     try:
+        identity = FileInfo()
+        if not kernel.GetFileInformationByHandle(handle, ctypes.byref(identity)):
+            return None
+        device = identity.volume
         if device not in VOLUME_CACHE:
             filesystem = ctypes.create_unicode_buffer(32)
             ok = kernel.GetVolumeInformationByHandleW(handle, None, 0, None, None, None,
@@ -95,7 +118,13 @@ def file_change_time(path, device):
         info = BasicInfo()
         if not kernel.GetFileInformationByHandleEx(handle, 0, ctypes.byref(info), ctypes.sizeof(info)):
             return None
-        return info.change if info.change > 0 else None
+        if info.change <= 0:
+            return None
+        def unix_ns(stamp):
+            return ((stamp.dwHighDateTime << 32 | stamp.dwLowDateTime) - 116444736000000000) * 100
+        return (identity.size_hi << 32 | identity.size_lo, unix_ns(identity.write),
+                unix_ns(identity.creation), identity.id_hi << 32 | identity.id_lo,
+                device, info.change)
     finally:
         kernel.CloseHandle(handle)
 
@@ -125,6 +154,12 @@ def load_hash_cache(full=False):
 
 
 def remember_hashes(key, hashes):
+    # Workers return SHA-256 for direct JP sources. Keep the MD5 already read
+    # by the parent, otherwise the next update would reread those same files.
+    known = HASH_CACHE.get(key) if os.name != 'nt' or key[-1] is not None else None
+    if known is not None and known is not hashes:
+        known.update(hashes)
+        hashes = known
     HASH_CACHE[key] = hashes
     if PERSISTENT_HASHES is not None and key[-1] is not None:
         PERSISTENT_HASHES[key[0]] = [list(key[1:]), hashes]
@@ -140,30 +175,41 @@ def save_hash_cache():
 
 
 def hash_key(path):
-    st = path.stat()
-    return (os.path.normcase(os.path.abspath(path)), st.st_size, st.st_mtime_ns,
-            st.st_ctime_ns, st.st_ino, st.st_dev, file_change_time(path, st.st_dev))
+    signature = windows_file_signature(path)
+    if signature is None:
+        st = path.stat()
+        signature = st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_dev, None
+    return (os.path.normcase(os.path.abspath(path)), *signature)
 
 
 def digest(path, algorithm='sha256'):
     path = Path(path)
+    # A backup can be requested by several layers. Serialize only the same
+    # file (or lock stripe), not independent disk reads.
+    with HASH_LOCKS[hash(os.path.normcase(os.path.abspath(path))) % len(HASH_LOCKS)]:
+        return file_digest(path, algorithm)
+
+
+def file_digest(path, algorithm):
     key = hash_key(path)
-    hashes = HASH_CACHE.get(key, {})
+    # A live writer may defer Windows timestamp updates until close. Without
+    # ChangeTime, don't even reuse an earlier in-process content check.
+    hashes = HASH_CACHE.get(key, {}) if os.name != 'nt' or key[-1] is not None else {}
     if not hashes and not FORCE_FULL_HASHES and PERSISTENT_HASHES is not None and key[-1] is not None:
         saved = PERSISTENT_HASHES.get(key[0])
         if saved and saved[0] == list(key[1:]):
             hashes = dict(saved[1])
-            HASH_STATS['reused'] += 1
+            with HASH_STATS_LOCK:
+                HASH_STATS['reused'] += 1
     if algorithm not in hashes:
-        h = hashlib.new(algorithm)
         with path.open('rb') as f:
-            for chunk in iter(lambda: f.read(4 * 1024 * 1024), b''):
-                h.update(chunk)
+            h = hashlib.file_digest(f, algorithm)
         if hash_key(path) != key:
             raise RuntimeError('校验期间文件发生变化：' + str(path))
         hashes[algorithm] = h.hexdigest()
-        HASH_STATS['read'] += 1
-        HASH_STATS['bytes'] += key[1]
+        with HASH_STATS_LOCK:
+            HASH_STATS['read'] += 1
+            HASH_STATS['bytes'] += key[1]
     remember_hashes(key, hashes)
     return hashes[algorithm]
 
@@ -208,8 +254,22 @@ def restore_entry(cn, entry):
 
 
 def safe(root, rel):
+    base = root.resolve()
     p = (root / rel).resolve()
-    if not p.is_relative_to(root.resolve()) or p == root.resolve():
+    def comparable(path):
+        value = str(path)
+        # Windows realpath can retain the long-path prefix when a missing
+        # parent is created concurrently (ERROR_PATH_NOT_FOUND becomes
+        # ERROR_FILE_NOT_FOUND). Compare namespaces equally; return the actual
+        # resolved path unchanged so long paths keep their access semantics.
+        if os.name == 'nt':
+            if value[:8].lower() == '\\\\?\\unc\\':
+                value = '\\\\' + value[8:]
+            elif value.startswith('\\\\?\\') and len(value) > 6 and value[5:7] == ':\\':
+                value = value[4:]
+        return Path(value)
+    base_key, path_key = comparable(base), comparable(p)
+    if not path_key.is_relative_to(base_key) or path_key == base_key:
         raise RuntimeError(f'路径越界：{rel}')
     return p
 
@@ -309,7 +369,7 @@ def roots():
 
 
 def ensure_closed():
-    kernel, _, ProcessEntry = windows_api()
+    kernel, _, ProcessEntry, _ = windows_api()
     snapshot = kernel.CreateToolhelp32Snapshot(2, 0)
     if snapshot == ctypes.c_void_p(-1).value:
         raise RuntimeError('无法检查游戏进程，未修改资源。')
@@ -507,19 +567,53 @@ def audit_official_bundles(cn, progress=False):
     """Include bundles never modified by the artwork switch."""
     _, rows, fingerprint = manifest(cn)
     missing, verified = [], {}
-    for index, (name, row) in enumerate(rows.items(), 1):
-        found = False
-        for path in layers(cn, name):
-            if (path.is_file() and path.stat().st_size == row['size']
-                    and digest(path, 'md5') == row['md5']):
-                found = True
-                key = ('\\' + str(path.relative_to(cn)).replace('/', '\\')).encode('utf-8')
-                verified[key] = row['md5'].encode('ascii')
+    candidates = collections.defaultdict(list)
+    cold_bytes = 0
+    canonical_names = {os.path.normcase(name): name for name in rows}
+    # Directory enumeration supplies sizes/times without tens of thousands of
+    # separate existence/stat calls. digest still checks live identity/content.
+    for folder in layers(cn, ''):
+        try:
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    name = canonical_names.get(os.path.normcase(entry.name))
+                    row = rows.get(name)
+                    if row is None or not entry.is_file():
+                        continue
+                    st = entry.stat()
+                    if st.st_size != row['size']:
+                        continue
+                    path = folder / name
+                    candidates[name].append((path, st.st_mtime_ns))
+        except FileNotFoundError:
+            continue
+    # Only candidates that may actually be read should select the parallel
+    # path. Unused shadow copies must not slow every warm scan down.
+    for name, paths in candidates.items():
+        for path, mtime in paths:
+            cached = (PERSISTENT_HASHES or {}).get(os.path.normcase(os.path.abspath(path)))
+            if (FORCE_FULL_HASHES or not cached or 'md5' not in cached[1]
+                    or cached[0][:2] != [rows[name]['size'], mtime]):
+                cold_bytes += rows[name]['size']
                 break
-        if not found:
+            if cached[1]['md5'] == rows[name]['md5']:
+                break
+    def check(item):
+        name, row = item
+        for path, _ in candidates[name]:
+            if digest(path, 'md5') == row['md5']:
+                key = ('\\' + str(path.relative_to(cn)).replace('/', '\\')).encode('utf-8')
+                return name, key, row['md5'].encode('ascii')
+        return name, None, None
+
+    checked = io_map(check, rows.items()) if cold_bytes > 128 * 1024 ** 2 else map(check, rows.items())
+    for name, key, value in checked:
+        if key is None:
             missing.append(name)
-        if progress and (index % 500 == 0 or index == len(rows)):
-            print(f'官方资源校验 {index}/{len(rows)}', flush=True)
+        else:
+            verified[key] = value
+    if progress:
+        print(f'官方资源校验 {len(rows)}/{len(rows)}', flush=True)
     return rows, fingerprint, missing, verified
 
 
@@ -611,11 +705,12 @@ def restore(cn, prepare_update=False):
     restored, preserved = 0, []
     print('校验恢复备份……', flush=True)
     # Validate every backup before restoring any file.
-    for e in state['entries'] + state.get('client_state', []):
+    def check_backup(e):
         if e['original']:
             b = safe(ROOT / 'backups/objects', e['original'])
             if not b.is_file() or digest(b) != e['original']:
                 raise RuntimeError('备份损坏，停止恢复：' + e['path'])
+    io_map(check_backup, state['entries'] + state.get('client_state', []))
     print('核对原件、切换副本与官方更新状态……', flush=True)
     _, current_rows, current_manifest = manifest(cn)
     prefs_snapshot = next((e for e in state.get('client_state', []) if e['path'] == 'prefs.dat'), None)
@@ -689,6 +784,20 @@ def inspect_bundle(p):
     return env, ab, tree
 
 
+def save_bundle(bundle):
+    # UnityPy's "lz4" uses LZ4HC level 9 by default. Ordinary LZ4 has the same
+    # lossless block format and avoids spending seconds recompressing textures.
+    import lz4.block
+    from UnityPy.helpers import CompressionHelper
+    previous = CompressionHelper.COMPRESSION_MAP[2]
+    CompressionHelper.COMPRESSION_MAP[2] = lambda data: lz4.block.compress(
+        data, mode='fast', acceleration=1, store_size=False)
+    try:
+        return bundle.save(packer='lz4')
+    finally:
+        CompressionHelper.COMPRESSION_MAP[2] = previous
+
+
 def normalize_art_path(path):
     """Normalize region folders and whitespace immediately before extensions."""
     return '/'.join(re.sub(r'\s+(?=\.|$)', '', part) for part in path.split('/')).replace('/cen/', '/noncen/')
@@ -705,7 +814,7 @@ def normalized_entries(entries):
 
 
 def verify_texture_patch(ce, ct, output, changed, unchanged, extra_objects=None):
-    output.write_bytes(ce.file.save(packer='lz4'))
+    output.write_bytes(save_bundle(ce.file))
     ve, _, vt = inspect_bundle(output)
     actual = {o.path_id: o for o in ve.objects}
     if vt != ct or set(actual) != {o.path_id for o in ce.objects}:
@@ -988,124 +1097,214 @@ def preserve_npc_motions(name, ce, ct, je, jt, missing):
             for path in missing]
 
 
-def build_plan(cn, jp):
-    cm, cr, ch = manifest(cn)
-    jm, jr, jh = manifest(jp)
-    for k in ('CLIENT_VER', 'GAME_VER'):
-        if cm[k] != jm[k]:
-            raise RuntimeError(f'两服 {k} 不一致（国服 {cm[k]} / 日服 {jm[k]}），未替换；请同步更新。')
-    print(f"客户端 {cm['CLIENT_VER']}，资源 {cm['GAME_VER']}；核对美术资源……", flush=True)
-    names = sorted(n for n in cr.keys() & jr.keys() if (ART.match(n) or COVER.fullmatch(n) or n in UI_ART) and cr[n] != jr[n])
-    work = ROOT / '.work/staging' / uuid.uuid4().hex
-    work.mkdir(parents=True)
-    plan, skipped = {}, {}
+def build_bundle(job):
+    name, cp, jpfile, jp, cr, output = job
+    cp, jpfile, jp, output = map(Path, (cp, jpfile, jp, output))
+    plan, skipped, dependencies = {}, {}, {}
     norm = normalize_art_path
-    for i, name in enumerate(names, 1):
-        cp, jpfile = original(cn, name, cr[name]), original(jp, name, jr[name])
-        if COVER.fullmatch(name) or name in UI_ART:
-            output = work / name
-            details = patch_cover_textures(cp, jpfile, output, UI_ART.get(name, COVER_TEXTURE))
-            if details:
-                plan[name] = dict(details, output=str(output), source=str(jpfile.relative_to(jp)),
-                                  aliases=0, sha256=digest(output), mode='国服界面仅替换美术贴图')
-                print(f"界面美术 {name}：替换 {len(details['textures'])} 张贴图，其他对象保持国服。", flush=True)
-            gc.collect()
-            continue
-        ce, ca, ct = inspect_bundle(cp)
-        je, ja, jt = inspect_bundle(jpfile)
-        if name.startswith('char_avg_2d_') and any(d + '.unity3d' not in cr for d in jt['m_Dependencies']):
-            output = work / name
-            details = patch_story_atlas(cp, jpfile, output)
-            if details:
-                unlisted = [d for d in details['deps'] if d not in cr]
-                details['deps'] = [d for d in details['deps'] if d in cr]
-                plan[name] = dict(details, output=str(output), source=str(jpfile.relative_to(jp)),
-                                  aliases=0, sha256=digest(output), mode='保留国服剧情对象、依赖及图集布局',
-                                  preserved_cn_unlisted_dependencies=unlisted)
-                print(f"剧情图集 {name}：替换 {len(details['textures'])} 张贴图，适配 {details['updated_sprite_meshes']} 个Sprite网格。", flush=True)
-                del ce, ca, ct, je, ja, jt
-                gc.collect()
-                continue
-        cnkeys, jpkeys = dict(ct['m_Container']), dict(jt['m_Container'])
+    if COVER.fullmatch(name) or name in UI_ART:
+        details = patch_cover_textures(cp, jpfile, output, UI_ART.get(name, COVER_TEXTURE))
+        if details:
+            plan[name] = dict(details, output=str(output), source=str(jpfile.relative_to(jp)),
+                              aliases=0, sha256=digest(output), mode='国服界面仅替换美术贴图')
+            print(f"界面美术 {name}：替换 {len(details['textures'])} 张贴图，其他对象保持国服。", flush=True)
+        return plan.get(name), skipped.get(name), dependencies
+    ce, ca, ct = inspect_bundle(cp)
+    je, ja, jt = inspect_bundle(jpfile)
+    dependencies = {d + '.unity3d': d + '.unity3d' in cr for d in jt['m_Dependencies']}
+    if name.startswith('char_avg_2d_') and any(d + '.unity3d' not in cr for d in jt['m_Dependencies']):
+        details = patch_story_atlas(cp, jpfile, output)
+        if details:
+            dependencies.update({d: d in cr for d in details['deps']})
+            unlisted = [d for d in details['deps'] if d not in cr]
+            details['deps'] = [d for d in details['deps'] if d in cr]
+            plan[name] = dict(details, output=str(output), source=str(jpfile.relative_to(jp)),
+                              aliases=0, sha256=digest(output), mode='保留国服剧情对象、依赖及图集布局',
+                              preserved_cn_unlisted_dependencies=unlisted)
+            print(f"剧情图集 {name}：替换 {len(details['textures'])} 张贴图，适配 {details['updated_sprite_meshes']} 个Sprite网格。", flush=True)
+            del ce, ca, ct, je, ja, jt
+            return plan.get(name), skipped.get(name), dependencies
+    cnkeys, jpkeys = dict(ct['m_Container']), dict(jt['m_Container'])
+    normalized = normalized_entries(jpkeys)
+    missing = [k for k in cnkeys if norm(k) not in normalized]
+    preserved_motions = preserve_npc_motions(name, ce, ct, je, jt, missing) if missing else None
+    if preserved_motions:
+        jpkeys = dict(jt['m_Container'])
         normalized = normalized_entries(jpkeys)
         missing = [k for k in cnkeys if norm(k) not in normalized]
-        preserved_motions = preserve_npc_motions(name, ce, ct, je, jt, missing) if missing else None
-        if preserved_motions:
-            jpkeys = dict(jt['m_Container'])
-            normalized = normalized_entries(jpkeys)
-            missing = [k for k in cnkeys if norm(k) not in normalized]
-            print(f'{name}：保留 {len(preserved_motions)} 个兼容国服动作资源，采用日服美术。', flush=True)
-        # Never guess substitute motions or silently drop CN public entry points.
-        if missing:
-            # Region-only banners must not block unrelated character portraits.
-            # Keep every CN entry, Sprite and non-portrait object in this bundle.
-            if ICON.fullmatch(name):
-                output = work / name
-                details = patch_cover_textures(cp, jpfile, output, ICON_PORTRAIT)
-                if details:
-                    plan[name] = dict(details, output=str(output), source=str(jpfile.relative_to(jp)),
-                                      aliases=0, sha256=digest(output), mode='保留国服图标包，仅替换角色头像和卡面')
-                    print(f"角色图标 {name}：替换 {len(details['textures'])} 张贴图，保留国服独有入口。", flush=True)
-                    del ce, ca, ct, je, ja, jt
-                    gc.collect()
-                    continue
-            skipped[name] = {'reason': '日服缺少国服公开资源入口', 'missing': missing}
-            continue
-        if sorted(a.name for a in ce.assets) != sorted(a.name for a in je.assets):
-            skipped[name] = {'reason': '两服资源内部标识不一致'}
-            continue
-        if any(a.unity_version != b.unity_version for a, b in zip(ce.assets, je.assets)):
-            raise RuntimeError('两服 Unity 资源格式版本不一致：' + name)
-        aliases = 0
+        print(f'{name}：保留 {len(preserved_motions)} 个兼容国服动作资源，采用日服美术。', flush=True)
+    # Never guess substitute motions or silently drop CN public entry points.
+    if missing:
+        # Region-only banners must not block unrelated character portraits.
+        # Keep every CN entry, Sprite and non-portrait object in this bundle.
+        if ICON.fullmatch(name):
+            details = patch_cover_textures(cp, jpfile, output, ICON_PORTRAIT)
+            if details:
+                plan[name] = dict(details, output=str(output), source=str(jpfile.relative_to(jp)),
+                                  aliases=0, sha256=digest(output), mode='保留国服图标包，仅替换角色头像和卡面')
+                print(f"角色图标 {name}：替换 {len(details['textures'])} 张贴图，保留国服独有入口。", flush=True)
+                del ce, ca, ct, je, ja, jt
+                return plan.get(name), skipped.get(name), dependencies
+        skipped[name] = {'reason': '日服缺少国服公开资源入口', 'missing': missing}
+        return plan.get(name), skipped.get(name), dependencies
+    if sorted(a.name for a in ce.assets) != sorted(a.name for a in je.assets):
+        skipped[name] = {'reason': '两服资源内部标识不一致'}
+        return plan.get(name), skipped.get(name), dependencies
+    if any(a.unity_version != b.unity_version for a, b in zip(ce.assets, je.assets)):
+        raise RuntimeError('两服 Unity 资源格式版本不一致：' + name)
+    aliases = 0
+    for k in cnkeys:
+        if k not in jpkeys:
+            jt['m_Container'].append((k, copy.deepcopy(normalized[norm(k)][1])))
+            aliases += 1
+    if aliases or preserved_motions:
         jp_object_hashes = {o.path_id: hashlib.sha256(o.data if o.data is not None else o.get_raw_data()).hexdigest()
                             for o in je.objects if o.path_id != ja.path_id}
-        for k in cnkeys:
-            if k not in jpkeys:
-                jt['m_Container'].append((k, copy.deepcopy(normalized[norm(k)][1])))
-                aliases += 1
-        output = work / name
-        if aliases or preserved_motions:
-            jt['m_Container'].sort(key=lambda pair: pair[0])
-            ja.save_typetree(jt)
-            output.write_bytes(je.file.save(packer='lz4'))
-            ve, va, vt = inspect_bundle(output)
-            if not set(cnkeys).issubset(dict(vt['m_Container'])):
-                raise RuntimeError('国服资源路径兼容校验失败：' + name)
-            saved = {o.path_id: o for o in ve.objects}
-            if set(saved) != {o.path_id for o in je.objects} or any(
-                    hashlib.sha256(saved[pid].get_raw_data()).hexdigest() != sha
-                    for pid, sha in jp_object_hashes.items()):
-                raise RuntimeError('路径兼容补丁改变日服模型或其他对象：' + name)
-            if preserved_motions:
-                for motion in preserved_motions:
-                    if hashlib.sha256(saved[motion['id']].get_raw_data()).hexdigest() != motion['sha256']:
-                        raise RuntimeError('国服补充动作保存校验失败：' + name)
-            del ve, va, vt
-        else:
-            shutil.copyfile(jpfile, output)
-        deps = [x + '.unity3d' for x in jt['m_Dependencies']]
-        # A new dependency absent from CN's manifest can break runtime loading.
-        if any(d not in cr for d in deps):
-            skipped[name] = {'reason': '日服依赖包在国服资源清单中缺失'}
-            continue
-        plan[name] = {'output': str(output), 'source': str(jpfile.relative_to(jp)),
-                      'aliases': aliases, 'deps': deps, 'sha256': digest(output),
-                      'preserved_cn_motions': preserved_motions or []}
-        if i % 10 == 0 or i == len(names):
-            print(f'资源结构核对 {i}/{len(names)}', flush=True)
-        del ce, ca, ct, je, ja, jt
-        gc.collect()
-    # Remove entire dependent groups when one of their replacement bundles is unsafe.
-    while True:
-        rejected = [n for n, p in plan.items() if any(d in skipped for d in p['deps'])]
-        if not rejected:
-            break
-        for n in rejected:
-            skipped[n] = {'reason': '依赖已跳过的不兼容美术包'}
-            del plan[n]
+        jt['m_Container'].sort(key=lambda pair: pair[0])
+        ja.save_typetree(jt)
+        output.write_bytes(save_bundle(je.file))
+        ve, va, vt = inspect_bundle(output)
+        if not set(cnkeys).issubset(dict(vt['m_Container'])):
+            raise RuntimeError('国服资源路径兼容校验失败：' + name)
+        saved = {o.path_id: o for o in ve.objects}
+        if set(saved) != {o.path_id for o in je.objects} or any(
+                hashlib.sha256(saved[pid].get_raw_data()).hexdigest() != sha
+                for pid, sha in jp_object_hashes.items()):
+            raise RuntimeError('路径兼容补丁改变日服模型或其他对象：' + name)
+        if preserved_motions:
+            for motion in preserved_motions:
+                if hashlib.sha256(saved[motion['id']].get_raw_data()).hexdigest() != motion['sha256']:
+                    raise RuntimeError('国服补充动作保存校验失败：' + name)
+        del ve, va, vt
+    else:
+        output = jpfile
+    deps = [x + '.unity3d' for x in jt['m_Dependencies']]
+    # A new dependency absent from CN's manifest can break runtime loading.
+    if any(d not in cr for d in deps):
+        skipped[name] = {'reason': '日服依赖包在国服资源清单中缺失'}
+        return plan.get(name), skipped.get(name), dependencies
+    plan[name] = {'output': str(output), 'source': str(jpfile.relative_to(jp)),
+                  'aliases': aliases, 'deps': deps, 'sha256': digest(output),
+                  'preserved_cn_motions': preserved_motions or [], 'direct': output == jpfile}
+    del ce, ca, ct, je, ja, jt
+    return plan.get(name), skipped.get(name), dependencies
+
+
+def valid_bundle_output(item, jp):
+    try:
+        output = Path(item['output']).resolve()
+        if item.get('direct'):
+            source = safe(jp, item['source'])
+            if output != source or source not in [p.resolve() for p in layers(jp, source.name)]:
+                return False
+        elif not output.is_relative_to((ROOT / '.work').resolve()):
+            return False
+        return output.is_file() and digest(output) == item['sha256']
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return False
+
+
+def run_bundle_job(job):
+    sources = [Path(job[1]), Path(job[2])]
+    before = [hash_key(p) for p in sources]
+    item, skipped, dependencies = build_bundle(job)
+    if before != [hash_key(p) for p in sources]:
+        raise RuntimeError('生成补丁期间源文件发生变化：' + job[0])
+    hashes = []
+    if item:
+        output = Path(item['output'])
+        if digest(output) != item['sha256']:
+            raise RuntimeError('补丁生成后内容发生变化：' + job[0])
+        key = hash_key(output)
+        hashes.append((key, HASH_CACHE[key]))
+    # Release Unity object cycles between jobs, after build_bundle's frame ends.
+    gc.collect()
+    return item, skipped, dependencies, hashes
+
+
+def run_bundle_jobs(jobs):
+    if len(jobs) < 2:
+        return list(map(run_bundle_job, jobs))
+    workers = min(8, max(1, (os.cpu_count() or 2) // 2), len(jobs))
+    if os.name == 'nt':
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [('length', ctypes.c_ulong), ('load', ctypes.c_ulong)] + [
+                (name, ctypes.c_ulonglong) for name in
+                ('total', 'available', 'page_total', 'page_available', 'virtual_total', 'virtual_available', 'extended')]
+        status = MemoryStatus()
+        status.length = ctypes.sizeof(status)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            workers = min(workers, max(1, (status.available - 1024 ** 3) // (768 * 1024 ** 2)))
+    print(f'并行生成 {len(jobs)} 个新补丁（{workers} 个工作进程）……', flush=True)
+    # Start large jobs first so a large UI bundle does not become a serial tail.
+    ordered = sorted(enumerate(jobs), key=lambda pair:
+                     sum(Path(path).stat().st_size for path in pair[1][1:3]), reverse=True)
+    results = [None] * len(jobs)
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for (index, _), result in zip(ordered, pool.map(run_bundle_job, [job for _, job in ordered])):
+            results[index] = result
+    return results
+
+
+def incremental_bundles(cn, jp, cr, jr, names):
+    """Cache individual analyses by both source contents, not whole-manifest hash."""
+    recipe = digest(Path(__file__))
+    folder = ROOT / '.work/bundles'
+    folder.mkdir(parents=True, exist_ok=True)
+    manifest_names = frozenset(cr)
+
+    def prepare(name):
+        # Source validation remains mandatory even when reusing analysis.
+        cp, jpfile = original(cn, name, cr[name]), original(jp, name, jr[name])
+        key = hashlib.sha256(json.dumps([recipe, name, cr[name], jr[name]],
+                                       sort_keys=True).encode()).hexdigest()
+        record_path = folder / (key + '.json')
+        try:
+            record = json.loads(record_path.read_text(encoding='utf-8'))
+            item, skipped = record['bundle'], record['skipped']
+            dependencies = record['dependencies']
+            valid = (record['key'] == key and isinstance(dependencies, dict)
+                     and all(isinstance(present, bool) and (dep in cr) == present
+                             for dep, present in dependencies.items())
+                     and (item is None or isinstance(item, dict))
+                     and (skipped is None or isinstance(skipped, dict)))
+            if valid and item and item.get('direct'):
+                item['source'], item['output'] = str(jpfile.relative_to(jp)), str(jpfile)
+            if valid and (item is None or valid_bundle_output(item, jp)):
+                return name, key, record_path, None, (item, skipped, dependencies, [])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        # A fresh output avoids overwriting any artifact referenced by an older
+        # validated plan when a cache entry is missing or damaged.
+        output = folder / (key + '-' + uuid.uuid4().hex + '.unity3d')
+        job = (name, str(cp), str(jpfile), str(jp), manifest_names, str(output))
+        return name, key, record_path, job, None
+
+    prepared = io_map(prepare, names)
+    pending = [entry for entry in prepared if entry[3] is not None]
+    results = iter(run_bundle_jobs([entry[3] for entry in pending]))
+    plan, skipped = {}, {}
+    for name, key, record_path, job, cached in prepared:
+        item, rejection, dependencies, hashes = next(results) if job else cached
+        for file_key, values in hashes:
+            if hash_key(Path(file_key[0])) != tuple(file_key):
+                raise RuntimeError('补丁工作进程结束后文件发生变化：' + name)
+            remember_hashes(tuple(file_key), values)
+        if job:
+            save_json(record_path, {'key': key, 'bundle': item, 'skipped': rejection,
+                                    'dependencies': dependencies}, compact=True)
+        if item:
+            plan[name] = item
+        if rejection:
+            skipped[name] = rejection
+    print(f'美术补丁：复用 {len(prepared) - len(pending)} 个，重新处理 {len(pending)} 个。', flush=True)
+    return plan, skipped
+
+
+def build_loading_index(source, plan, output):
     # Retain the CN loading index; add only dependencies needed by selected artwork.
     # Copying the JP index wholesale would also change unrelated CN game resources.
-    we, wa, wt = inspect_bundle(original(cn, 'win.unity3d', cr['win.unity3d']))
+    we, wa, wt = inspect_bundle(source)
     mo = next(o for o in we.objects if o.type.name == 'AssetBundleManifest')
     mt = mo.read_typetree()
     before = copy.deepcopy(mt)
@@ -1124,15 +1323,61 @@ def build_plan(cn, jp):
             if idx not in changed_ids and entry != infos[idx]:
                 raise RuntimeError('无关资源的加载索引发生变化，停止。')
         mo.save_typetree(mt)
-        output = work / 'win.unity3d'
-        output.write_bytes(we.file.save(packer='lz4'))
+        output.write_bytes(save_bundle(we.file))
         ve, _, _ = inspect_bundle(output)
         actual = next(o for o in ve.objects if o.type.name == 'AssetBundleManifest').read_typetree()
         if actual != mt:
             raise RuntimeError('美术依赖索引保存校验失败。')
-        plan['win.unity3d'] = {'output': str(output), 'source': '国服美术加载索引局部兼容',
+        return {'output': str(output), 'source': '国服美术加载索引局部兼容',
                                'aliases': 0, 'deps': [], 'sha256': digest(output),
                                'updated_art_dependencies': len(changed_ids)}
+    return None
+
+
+def loading_index(cn, rows, plan):
+    # Index bytes depend on the original CN index and selected dependencies,
+    # not image payloads or unrelated manifest/version changes.
+    source = original(cn, 'win.unity3d', rows['win.unity3d'])
+    dependencies = {name: sorted(set(item['deps'])) for name, item in plan.items()}
+    key = hashlib.sha256(json.dumps([digest(Path(__file__)), rows['win.unity3d'], dependencies],
+                                   sort_keys=True).encode()).hexdigest()
+    folder = ROOT / '.work/indexes'
+    folder.mkdir(parents=True, exist_ok=True)
+    cache = folder / (key + '.json')
+    try:
+        record = json.loads(cache.read_text(encoding='utf-8'))
+        item = record['bundle']
+        if record['key'] == key and (item is None or (
+                isinstance(item, dict) and not item.get('direct') and valid_bundle_output(item, cn))):
+            return item
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    output = folder / (key + '-' + uuid.uuid4().hex + '.unity3d')
+    item = build_loading_index(source, plan, output)
+    save_json(cache, {'key': key, 'bundle': item}, compact=True)
+    return item
+
+
+def build_plan(cn, jp):
+    cm, cr, ch = manifest(cn)
+    jm, jr, jh = manifest(jp)
+    for k in ('CLIENT_VER', 'GAME_VER'):
+        if cm[k] != jm[k]:
+            raise RuntimeError(f'两服 {k} 不一致（国服 {cm[k]} / 日服 {jm[k]}），未替换；请同步更新。')
+    print(f"客户端 {cm['CLIENT_VER']}，资源 {cm['GAME_VER']}；核对美术资源……", flush=True)
+    names = sorted(n for n in cr.keys() & jr.keys() if (ART.match(n) or COVER.fullmatch(n) or n in UI_ART) and cr[n] != jr[n])
+    plan, skipped = incremental_bundles(cn, jp, cr, jr, names)
+    # Remove entire dependent groups when one of their replacement bundles is unsafe.
+    while True:
+        rejected = [n for n, p in plan.items() if any(d in skipped for d in p['deps'])]
+        if not rejected:
+            break
+        for n in rejected:
+            skipped[n] = {'reason': '依赖已跳过的不兼容美术包'}
+            del plan[n]
+    index = loading_index(cn, cr, plan)
+    if index:
+        plan['win.unity3d'] = index
     report = {'versions': {'cn': cm, 'jp': jm}, 'fingerprints': [ch, jh], 'recipe': digest(Path(__file__)),
               'bundles': plan, 'skipped': skipped,
               'scope': '角色立绘、剧情图集、Live2D、NPC、秘纹、CG、图标、招募封面及星塔手册美术贴图；保留国服脚本、配置表、语音、界面对象和程序'}
@@ -1153,19 +1398,14 @@ def reusable_plan(cn, jp):
             valid = (report['fingerprints'] == [ch, jh]
                      and report['recipe'] == digest(Path(__file__)))
             if valid:
-                for name in cr.keys() & jr.keys():
-                    if (ART.match(name) or COVER.fullmatch(name) or name in UI_ART) and cr[name] != jr[name]:
-                        original(cn, name, cr[name])
-                        original(jp, name, jr[name])
+                names = [name for name in cr.keys() & jr.keys()
+                         if (ART.match(name) or COVER.fullmatch(name) or name in UI_ART) and cr[name] != jr[name]]
+                def check_source(name):
+                    original(cn, name, cr[name])
+                    original(jp, name, jr[name])
+                io_map(check_source, names)
                 original(cn, 'win.unity3d', cr['win.unity3d'])
-                for item in report['bundles'].values():
-                    output = Path(item['output'])
-                    if not output.resolve().is_relative_to((ROOT / '.work').resolve()):
-                        valid = False
-                        break
-                    if not output.is_file() or digest(output) != item['sha256']:
-                        valid = False
-                        break
+                valid = all(io_map(lambda item: valid_bundle_output(item, jp), report['bundles'].values()))
             if valid:
                 print('复用已验证美术补丁，源文件与补丁内容校验通过。', flush=True)
                 return report
@@ -1184,11 +1424,11 @@ def verify(cn, verbose=True):
         return False
     if state['cn'] != str(cn):
         raise RuntimeError('替换记录属于另一个目录。')
-    bad = []
-    for e in state['entries']:
+    def check(e):
         p = safe(cn, e['path'])
         if not p.is_file() or digest(p) != e['patched']:
-            bad.append(e['path'])
+            return e['path']
+    bad = [path for path in io_map(check, state['entries']) if path]
     if verbose:
         print(f"文件校验：{len(state['entries']) - len(bad)}/{len(state['entries'])} 一致。")
         for path in bad[:20]:
@@ -1210,33 +1450,45 @@ def apply(cn, jp):
         return
     if old:
         restore(cn)
-    print('替换前核对官方资源完整性……', flush=True)
-    _, _, missing, _ = audit_official_bundles(cn, progress=True)
+    print('替换前核对官方资源完整性并准备美术补丁……', flush=True)
+    # Both stages only read game files. Finish both successfully before any
+    # backup, switch-slot preparation, or client record/game-file write.
+    with ThreadPoolExecutor(max_workers=1) as checking:
+        audit = checking.submit(audit_official_bundles, cn, True)
+        report = reusable_plan(cn, jp)
+        _, checked_manifest, missing, _ = audit.result()
     if missing:
         raise RuntimeError('国服官方资源缺失或损坏，请先运行一键恢复安排资源补全：' + '、'.join(missing[:8]))
-    report = reusable_plan(cn, jp)
+    if checked_manifest != report['fingerprints'][0]:
+        raise RuntimeError('检查期间官方清单发生变化，请重试。')
     if not report['bundles']:
         print('本版本没有可安全替换的差异美术包。')
         return
     state = {'cn': str(cn), 'fingerprints': report['fingerprints'], 'versions': report['versions'], 'recipe': report['recipe'],
              'complete': False, 'entries': []}
     print('核对目标文件、备份与同盘切换缓存……', flush=True)
-    changes = []
+    candidates = []
     for name, p in report['bundles'].items():
         targets = {target for target in layers(cn, name) if target.is_file()}
         # Persistent is the writable game resource tier; also replace existing shadow copies.
         targets.add(cn / 'Persistent_Store/AssetBundles' / name)
-        for target in sorted(targets):
-            previous = digest(target) if target.exists() else None
-            if previous != p['sha256']:
-                changes.append((Path(p['output']), target, previous, p['sha256']))
-    needed = 0
-    for source, target, previous, patched in changes:
+        candidates.extend((Path(p['output']), target, p['sha256']) for target in sorted(targets))
+    def inspect_target(candidate):
+        source, target, patched = candidate
+        previous = digest(target) if target.exists() else None
+        if previous != patched:
+            return source, target, previous, patched
+    changes = [change for change in io_map(inspect_target, candidates) if change]
+    def required_space(change):
+        source, target, previous, patched = change
+        needed = 0
         slot = switch_slot(cn, str(target.relative_to(cn)), 'patched')
         if not slot.is_file() or digest(slot) != patched:
             needed += source.stat().st_size
         if previous and not (ROOT / 'backups/objects' / previous).exists():
             needed += target.stat().st_size
+        return needed
+    needed = sum(io_map(required_space, changes))
     if shutil.disk_usage(cn).free < needed + 512 * 1024 * 1024:
         raise RuntimeError('磁盘空间不足以安全备份和替换。')
     ensure_closed()
@@ -1244,18 +1496,28 @@ def apply(cn, jp):
         raise RuntimeError('准备过程中客户端已更新，请重试。')
     state['client_state'] = snapshot_client_state(cn)
     # Save all originals and the complete recovery journal before first game-file write.
-    for source, target, previous, patched in changes:
-        if previous:
-            backup = ROOT / 'backups/objects' / previous
-            if not backup.exists():
-                atomic_copy(target, backup)
-            if digest(backup) != previous:
-                raise RuntimeError('原文件备份校验失败：' + target.name)
+    backups = {previous: target for _, target, previous, _ in changes if previous}
+    def prepare_backup(item):
+        previous, target = item
+        backup = ROOT / 'backups/objects' / previous
+        if not backup.exists():
+            atomic_copy(target, backup)
+        if digest(backup) != previous:
+            raise RuntimeError('原文件备份校验失败：' + target.name)
+    io_map(prepare_backup, backups.items())
+
+    safe(cn, '.art-switch').mkdir(parents=True, exist_ok=True)
+    def prepare_slot(change):
+        source, target, previous, patched = change
         rel = str(target.relative_to(cn))
         slot = switch_slot(cn, rel, 'patched')
         if not slot.is_file() or digest(slot) != patched:
             atomic_copy(source, slot)
-        state['entries'].append({'path': rel, 'original': previous, 'patched': patched, 'switch': True})
+        return {'path': rel, 'original': previous, 'patched': patched, 'switch': True}
+    state['entries'] = io_map(prepare_slot, changes)
+    ensure_closed()
+    if report['fingerprints'] != [manifest(cn)[2], manifest(jp)[2]]:
+        raise RuntimeError('备份准备过程中客户端已更新，请重试。')
     save_json(STATE, state)
     try:
         for index, (source, target, previous, patched) in enumerate(changes, 1):
