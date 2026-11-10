@@ -12,7 +12,7 @@ if not exist "%art_python%" (
   goto finish
 )
 :run
-"%art_python%" %art_flags% -B -X utf8 "%~dp0replace_art.py" restore
+"%art_python%" %art_flags% -B -X utf8 "%~dp0replace_art.py" restore %*
 set "result=%errorlevel%"
 if not "%result%"=="0" echo 操作未完成，请查看上方提示。
 :finish

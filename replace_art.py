@@ -5,6 +5,7 @@ import argparse
 import base64
 import collections
 import copy
+import ctypes
 import datetime
 import gc
 import hashlib
@@ -15,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import traceback
 import uuid
 
@@ -28,37 +30,154 @@ ICON_PORTRAIT = re.compile(r'^assets/assetbundles/icon/(?:head/head_\d+_[a-z0-9_
 COVER_TEXTURE = re.compile(r'^assets/assetbundles/ui_gachacover/cover_\d+/(?:sprite|textures?)/(?:(?:bg|zs|fx)_gacha_)[a-z0-9_]+\.png$')
 UI_ART = {'ui_big_sprites.unity3d': re.compile(r'^assets/assetbundles/ui/big_sprites/zs_startowerhandbook_entrance\d+\.png$')}
 HASH_CACHE = {}
+PERSISTENT_HASHES = None
+FORCE_FULL_HASHES = False
+HASH_STATS = collections.Counter()
+WINDOWS_API = None
+VOLUME_CACHE = {}
+
+
+def windows_api():
+    """Use native metadata/process APIs without starting PowerShell or WMI."""
+    global WINDOWS_API
+    if WINDOWS_API is None:
+        from ctypes import wintypes as w
+
+        class BasicInfo(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_longlong) for name in
+                        ('creation', 'access', 'write', 'change')] + [('attributes', w.DWORD)]
+
+        class ProcessEntry(ctypes.Structure):
+            _fields_ = [('size', w.DWORD), ('usage', w.DWORD), ('pid', w.DWORD),
+                        ('heap', ctypes.c_size_t), ('module', w.DWORD), ('threads', w.DWORD),
+                        ('parent', w.DWORD), ('priority', w.LONG), ('flags', w.DWORD),
+                        ('name', w.WCHAR * 260)]
+
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        signatures = {
+            'CreateFileW': ([w.LPCWSTR, w.DWORD, w.DWORD, w.LPVOID, w.DWORD, w.DWORD, w.HANDLE], w.HANDLE),
+            'GetFileInformationByHandleEx': ([w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD], w.BOOL),
+            'GetVolumeInformationByHandleW': ([w.HANDLE, w.LPWSTR, w.DWORD, w.LPDWORD,
+                                              w.LPDWORD, w.LPDWORD, w.LPWSTR, w.DWORD], w.BOOL),
+            'CloseHandle': ([w.HANDLE], w.BOOL),
+            'CreateToolhelp32Snapshot': ([w.DWORD, w.DWORD], w.HANDLE),
+            'Process32FirstW': ([w.HANDLE, ctypes.POINTER(ProcessEntry)], w.BOOL),
+            'Process32NextW': ([w.HANDLE, ctypes.POINTER(ProcessEntry)], w.BOOL),
+            'OpenProcess': ([w.DWORD, w.BOOL, w.DWORD], w.HANDLE),
+            'QueryFullProcessImageNameW': ([w.HANDLE, w.DWORD, w.LPWSTR, w.LPDWORD], w.BOOL),
+        }
+        for name, (args, result) in signatures.items():
+            fn = getattr(kernel, name)
+            fn.argtypes, fn.restype = args, result
+        WINDOWS_API = kernel, BasicInfo, ProcessEntry
+    return WINDOWS_API
+
+
+def file_change_time(path, device):
+    # On Windows st_ctime is creation time, NOT metadata change time. In-place
+    # edits followed by restoring mtime must still invalidate a previous hash.
+    if os.name != 'nt' or str(path).startswith('\\\\'):
+        return None
+    kernel, BasicInfo, _ = windows_api()
+    # Do not reuse metadata while another handle has write access: NTFS can
+    # defer timestamp updates until that writer closes its handle.
+    handle = kernel.CreateFileW(str(path), 0x80000000, 5, None, 3, 0x02000000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        return None
+    try:
+        if device not in VOLUME_CACHE:
+            filesystem = ctypes.create_unicode_buffer(32)
+            ok = kernel.GetVolumeInformationByHandleW(handle, None, 0, None, None, None,
+                                                      filesystem, len(filesystem))
+            VOLUME_CACHE[device] = bool(ok and filesystem.value == 'NTFS')
+        if not VOLUME_CACHE[device]:
+            return None
+        info = BasicInfo()
+        if not kernel.GetFileInformationByHandleEx(handle, 0, ctypes.byref(info), ctypes.sizeof(info)):
+            return None
+        return info.change if info.change > 0 else None
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def load_hash_cache(full=False):
+    global PERSISTENT_HASHES, FORCE_FULL_HASHES
+    HASH_CACHE.clear()
+    HASH_STATS.clear()
+    FORCE_FULL_HASHES = full
+    PERSISTENT_HASHES = {}
+    try:
+        data = json.loads((ROOT / '.work/file-hashes.json').read_text(encoding='utf-8'))
+        if data['version'] != 1 or not isinstance(data['files'], dict):
+            return
+        for path, entry in data['files'].items():
+            signature, hashes = entry
+            if (not isinstance(signature, list) or len(signature) != 6
+                    or not all(isinstance(n, int) for n in signature)
+                    or not isinstance(hashes, dict) or not hashes
+                    or any(name not in ('sha256', 'md5') or not isinstance(value, str)
+                           or not re.fullmatch('[0-9a-f]{' + str(64 if name == 'sha256' else 32) + '}', value)
+                           for name, value in hashes.items())):
+                continue
+            PERSISTENT_HASHES[path] = entry
+    except (OSError, ValueError, KeyError, TypeError):
+        PERSISTENT_HASHES = {}
+
+
+def remember_hashes(key, hashes):
+    HASH_CACHE[key] = hashes
+    if PERSISTENT_HASHES is not None and key[-1] is not None:
+        PERSISTENT_HASHES[key[0]] = [list(key[1:]), hashes]
+
+
+def save_hash_cache():
+    if PERSISTENT_HASHES is not None:
+        try:
+            save_json(ROOT / '.work/file-hashes.json', {'version': 1, 'files': PERSISTENT_HASHES}, compact=True)
+        except OSError as exc:
+            # Cache failure must never turn a successful switch into rollback.
+            print('校验缓存未能保存，下次将重新读取文件：' + str(exc), flush=True)
 
 
 def hash_key(path):
     st = path.stat()
-    return (str(path), st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
+    return (os.path.normcase(os.path.abspath(path)), st.st_size, st.st_mtime_ns,
+            st.st_ctime_ns, st.st_ino, st.st_dev, file_change_time(path, st.st_dev))
 
 
 def digest(path, algorithm='sha256'):
     path = Path(path)
     key = hash_key(path)
-    if key not in HASH_CACHE:
-        # Both are required by backup safety and the official update manifest.
-        hashes = {name: hashlib.new(name) for name in ('sha256', 'md5')}
+    hashes = HASH_CACHE.get(key, {})
+    if not hashes and not FORCE_FULL_HASHES and PERSISTENT_HASHES is not None and key[-1] is not None:
+        saved = PERSISTENT_HASHES.get(key[0])
+        if saved and saved[0] == list(key[1:]):
+            hashes = dict(saved[1])
+            HASH_STATS['reused'] += 1
+    if algorithm not in hashes:
+        h = hashlib.new(algorithm)
         with path.open('rb') as f:
             for chunk in iter(lambda: f.read(4 * 1024 * 1024), b''):
-                for h in hashes.values():
-                    h.update(chunk)
+                h.update(chunk)
         if hash_key(path) != key:
             raise RuntimeError('校验期间文件发生变化：' + str(path))
-        HASH_CACHE[key] = {name: h.hexdigest() for name, h in hashes.items()}
-    return HASH_CACHE[key][algorithm]
+        hashes[algorithm] = h.hexdigest()
+        HASH_STATS['read'] += 1
+        HASH_STATS['bytes'] += key[1]
+    remember_hashes(key, hashes)
+    return hashes[algorithm]
 
 
 def verified_move(src, dst, expected):
-    # Only reuse hashes for this exact verified file, within this process.
+    # Rename preserves the verified file identity; record its new ChangeTime.
     if digest(src) != expected:
         raise RuntimeError('切换文件校验失败：' + str(src))
     hashes = HASH_CACHE[hash_key(src)]
     dst.parent.mkdir(parents=True, exist_ok=True)
     os.replace(src, dst)
-    HASH_CACHE[hash_key(dst)] = hashes
+    remember_hashes(hash_key(dst), hashes)
+    if PERSISTENT_HASHES is not None:
+        PERSISTENT_HASHES.pop(os.path.normcase(os.path.abspath(src)), None)
 
 
 def switch_slot(cn, rel, kind):
@@ -95,11 +214,12 @@ def safe(root, rel):
     return p
 
 
-def save_json(path, value):
+def save_json(path, value, compact=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix('.tmp')
     with tmp.open('w', encoding='utf-8', newline='\n') as f:
-        json.dump(value, f, ensure_ascii=False, indent=2)
+        json.dump(value, f, ensure_ascii=False, indent=None if compact else 2,
+                  separators=(',', ':') if compact else None)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
@@ -189,12 +309,35 @@ def roots():
 
 
 def ensure_closed():
-    script = "Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(xtlr|StellaSora)\\.exe$' -or $_.ExecutablePath -match 'StellaSora_(CN|JP)_Gamelauncher' } | Select-Object -ExpandProperty Name"
-    result = subprocess.run(['powershell.exe', '-NoProfile', '-Command', script], capture_output=True, creationflags=0x08000000)
-    if result.returncode:
+    kernel, _, ProcessEntry = windows_api()
+    snapshot = kernel.CreateToolhelp32Snapshot(2, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
         raise RuntimeError('无法检查游戏进程，未修改资源。')
-    if result.stdout.strip():
-        raise RuntimeError('请退出国服、日服游戏及启动器后再运行。')
+    try:
+        entry = ProcessEntry()
+        entry.size = ctypes.sizeof(entry)
+        ok = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            name = entry.name.lower()
+            blocked = name in ('xtlr.exe', 'stellasora.exe') or bool(
+                re.search(r'stellasora_(cn|jp)_gamelauncher', name))
+            if not blocked:
+                process = kernel.OpenProcess(0x1000, False, entry.pid)
+                if process:
+                    try:
+                        path = ctypes.create_unicode_buffer(32768)
+                        size = ctypes.c_ulong(len(path))
+                        if kernel.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(size)):
+                            blocked = bool(re.search(r'StellaSora_(CN|JP)_Gamelauncher', path.value, re.I))
+                    finally:
+                        kernel.CloseHandle(process)
+            if blocked:
+                raise RuntimeError('请退出国服、日服游戏及启动器后再运行。')
+            ok = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+        if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+            raise RuntimeError('无法完整检查游戏进程，未修改资源。')
+    finally:
+        kernel.CloseHandle(snapshot)
 
 
 def manifest(root):
@@ -1141,6 +1284,7 @@ def main():
         sys.stderr.reconfigure(encoding='utf-8', errors='replace')
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['apply', 'restore', 'verify', 'plan', 'configure'], default='apply', nargs='?')
+    parser.add_argument('--full', action='store_true', help='忽略跨次校验缓存，重新读取文件内容')
     args = parser.parse_args()
     (ROOT / '.work').mkdir(exist_ok=True)
     # Lock lifetime follows process lifetime, including crashes.
@@ -1157,20 +1301,27 @@ def main():
         if args.action == 'configure':
             configure_roots()
             return 0
-        cn, jp = roots()
-        if args.action != 'verify':
-            ensure_closed()
-        if args.action == 'apply':
-            apply(cn, jp)
-        elif args.action == 'restore':
-            restore(cn, prepare_update=True)
-        elif args.action == 'verify':
-            if not verify(cn):
-                return 2
-        else:
-            if read_state():
-                raise RuntimeError('请先恢复原文件再生成新的预览；已应用内容请使用校验入口。')
-            build_plan(cn, jp)
+        started = time.perf_counter()
+        load_hash_cache(full=args.full)
+        try:
+            cn, jp = roots()
+            if args.action != 'verify':
+                ensure_closed()
+            if args.action == 'apply':
+                apply(cn, jp)
+            elif args.action == 'restore':
+                restore(cn, prepare_update=True)
+            elif args.action == 'verify':
+                if not verify(cn):
+                    return 2
+            else:
+                if read_state():
+                    raise RuntimeError('请先恢复原文件再生成新的预览；已应用内容请使用校验入口。')
+                build_plan(cn, jp)
+        finally:
+            save_hash_cache()
+            print(f"用时 {time.perf_counter() - started:.2f} 秒；"
+                  f"复用校验 {HASH_STATS['reused']} 个，读取 {HASH_STATS['bytes'] / 1024 ** 2:.1f} MiB。", flush=True)
     return 0
 
 

@@ -25,3 +25,5 @@ uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 | `校验替换.cmd` | 检查已替换文件是否完整、是否被更新覆盖。 |
 
 提示资源补全时，先启动国服完成下载和更新，再使用一键替换。
+
+默认复用未变动文件的校验结果，首次运行或更新后会较慢。如需重新读取全部内容校验，在对应 CMD 的命令行后加 `--full`（例如 `校验替换.cmd --full`）。
