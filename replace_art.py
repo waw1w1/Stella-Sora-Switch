@@ -721,8 +721,12 @@ def restore(cn, prepare_update=False):
                  and old_prefs.get('PACKAGE_TAGS') == new_prefs.get('PACKAGE_TAGS'))
     # Finish interrupted two-rename switches before normal update recovery.
     for e in state['entries']:
+        # Normal switches still have their live target. Resolve parked paths
+        # only for interrupted switches, where an original may need returning.
+        if not e.get('switch') or not e['original'] or safe(cn, e['path']).exists():
+            continue
         parked = switch_slot(cn, e['path'], 'original')
-        if e.get('switch') and not safe(cn, e['path']).exists() and e['original'] and parked.is_file():
+        if parked.is_file():
             row = current_rows.get(Path(e['path']).name)
             matches_current = (row and parked.stat().st_size == row['size']
                                and digest(parked, 'md5') == row['md5'])
